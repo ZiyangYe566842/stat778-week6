@@ -1,0 +1,335 @@
+---
+title: inclass-week6
+author: Ziyang Ye
+format:
+    html:
+        code-fold: False
+        embed-resources: true
+        self-contained: true
+        theme:
+            light: [cosmo, theme.scss]
+            dark: [cosmo, theme-dark.scss]
+        toc: true
+---
+
+### Activity 1
+
+
+
+```{r}
+
+library(randomForest)
+# data cleaning
+dat <- read.csv("cherry-bloom-early.csv")
+dat_sub <- dat[, c("early_bloom", grep("tmax", names(dat), value = TRUE))]
+dat_sub$early_bloom <- trimws(dat_sub$early_bloom)   
+dat_sub$early_bloom <- tolower(dat_sub$early_bloom)  
+dat_sub$early_bloom <- factor(dat_sub$early_bloom, levels = c("no", "yes"))
+
+# check "no"/"yes"
+print(table(dat_sub$early_bloom, useNA = "ifany"))
+p <- ncol(dat_sub) - 1
+m_values <- round(seq(1, p, length.out = 3))
+T_values <- seq(200, 1000, length.out = 5)
+grid <- expand.grid(m = m_values, T = T_values)
+grid_list <- apply(grid, 1, function(row) {
+  list(m = row["m"], T = row["T"])
+})
+print(grid_list)
+
+```
+### Activity 2
+
+```{r}
+
+set.seed(123)
+create_folds <- function(n, nfolds, strata) {
+  folds <- vector("list", nfolds)
+  for (s in unique(strata)) {
+    idx <- which(strata == s)
+    idx <- sample(idx)
+    base_size <- length(idx) %/% nfolds
+    remainder <- length(idx) %% nfolds
+    fold_sizes <- rep(base_size, nfolds)
+    if (remainder > 0) {
+      fold_sizes[1:remainder] <- fold_sizes[1:remainder] + 1
+    }
+    start <- 1
+    for (i in 1:nfolds) {
+      end <- start + fold_sizes[i] - 1
+      folds[[i]] <- c(folds[[i]], idx[start:end])
+      start <- end + 1
+    }
+  }
+  folds
+}
+
+fold_indices <- create_folds(
+  n = nrow(dat_sub),
+  nfolds = 5,
+  strata = dat_sub$early_bloom
+)
+fold_indices
+
+```
+
+
+
+### Activity 3
+```{r}
+# Load packages
+library(randomForest)
+library(pROC)
+library(parallel)
+
+# 1. Create a PSOCK cluster (2 nodes)
+cl <- makePSOCKcluster(2)
+
+# 2. Export objects to workers
+clusterExport(cl, c("dat_sub", "grid_list", "fold_indices"), envir = environment())
+clusterEvalQ(cl, library(randomForest))
+
+# 3. Parallel loop over folds
+fold_results <- clusterApply(cl, fold_indices, function(test_idx) {
+  train_data <- dat_sub[-test_idx, ]
+  test_data  <- dat_sub[ test_idx, ]
+  
+  # Ensure factor response
+  if(!is.factor(train_data[, 1])) train_data[, 1] <- as.factor(train_data[, 1])
+  pos_class <- levels(train_data[, 1])[2]  # assume "yes"
+  
+  # Fit RF for each hyper-param combo
+  res <- vector("list", length(grid_list))
+  for(i in seq_along(grid_list)) {
+    m_val <- grid_list[[i]]$m
+    T_val <- grid_list[[i]]$T
+    
+    rf_fit <- randomForest(x = train_data[, -1], y = train_data[, 1],
+                           mtry = m_val, ntree = T_val)
+    preds <- predict(rf_fit, newdata = test_data[, -1], type = "prob")[, pos_class]
+    res[[i]] <- list(predicted = preds, true = test_data[, 1])
+  }
+  res
+})
+
+# 4. Stop cluster
+stopCluster(cl)
+
+# 5. Compute AUC for each combo
+G <- length(grid_list)
+auc_results <- vector("list", G)
+
+for(i in 1:G) {
+  preds <- unlist(lapply(fold_results, function(x) x[[i]]$predicted))
+  trues <- unlist(lapply(fold_results, function(x) x[[i]]$true))
+  # Factor with "no" first, "yes" second
+  trues <- factor(trues, levels = c("no", "yes"))
+  
+  if(length(unique(trues)) < 2) {
+    warning(paste("Combo", i, "has only one class."))
+    auc_val <- NA
+  } else {
+    roc_obj <- roc(trues, preds, levels = rev(levels(trues)))
+    auc_val <- auc(roc_obj)
+  }
+  auc_results[[i]] <- list(auc = auc_val, predicted = preds, true = trues)
+}
+
+# 6. Show AUCs
+auc_values <- sapply(auc_results, function(x) x$auc)
+print(auc_values)
+```
+
+### Activity 4
+
+1. **Parallel over $R$**  
+   - Each replication (running $K$ folds and $G$ combos) is a task.  
+   - Fewer, larger tasks. Less communication overhead, but can underuse cores if $R$ is small.
+
+2. **Parallel over $K$**  
+   - Each fold is a task.  
+   - Medium-sized tasks, moderate communication. Can keep cores busy if $K$ is large.
+
+3. **Parallel over $G$**  Each hyper-parameter combo is a task.  If $G$ is small, not enough tasks; if $G$ is large, overhead grows.
+
+4. **Flatten over $R \times K$**  Each fold in each replication is a task (still runs all $G$ combos).  More tasks, better resource usage. Moderate communication.
+
+5. **Flatten over $R \times K \times G$**  Each (replication, fold, combo) is a separate task.  Many small tasks. High communication overhead but maximum concurrency.
+
+discussion part:Larger tasks (1 or 2) reduce communication but may leave cores idle.Smaller tasks (5) fully occupy cores but increase overhead.
+**Choice**  
+Flattening over $R \times K$ (strategy 4) typically balances task size and number of tasks. Each fold handles all $G$ combos, avoiding too many tiny tasks, yet providing enough parallelism to keep workers busy.
+
+
+
+
+### Activity 5
+```{r}
+
+R <- 3
+K <- length(fold_indices)  # Number of folds
+G <- length(grid_list)     # Number of hyper-param combos
+
+# Replicate the K-fold indices for R replications, then flatten
+rep_folds <- replicate(R, fold_indices, simplify = FALSE)
+all_folds <- do.call(c, rep_folds)  # length = R*K
+
+# Create a cluster and export data
+cl <- makePSOCKcluster(2)
+clusterExport(cl, c("dat_sub", "grid_list", "all_folds"), envir = environment())
+clusterEvalQ(cl, library(randomForest))
+
+# Parallel over R*K folds
+fold_results <- clusterApply(cl, seq_along(all_folds), function(i) {
+  test_idx <- all_folds[[i]]
+  train_data <- dat_sub[-test_idx, ]
+  test_data  <- dat_sub[ test_idx, ]
+  
+  if(!is.factor(train_data[,1])) train_data[,1] <- as.factor(train_data[,1])
+  pos_class <- levels(train_data[,1])[2]
+  
+  # For each hyper-param combo
+  res <- vector("list", length(grid_list))
+  for(gid in seq_along(grid_list)) {
+    rf_fit <- randomForest(
+      x = train_data[, -1],
+      y = train_data[, 1],
+      mtry = grid_list[[gid]]$m,
+      ntree = grid_list[[gid]]$T
+    )
+    preds <- predict(rf_fit, newdata = test_data[, -1], type = "prob")[, pos_class]
+    res[[gid]] <- list(predicted = preds, true = test_data[,1])
+  }
+  res
+})
+
+stopCluster(cl)
+
+# fold_results is length R*K; each element is a list of length G.
+
+# Compute AUC for each replication and hyper-param combo
+results_df <- data.frame(Rep = integer(), Combo = integer(), AUC = numeric())
+
+for(rp in 1:R) {
+  # Folds for replication rp
+  fold_ids <- ((rp - 1)*K + 1):(rp*K)
+  
+  for(gid in 1:G) {
+    # Aggregate predictions across K folds
+    all_preds <- unlist(lapply(fold_ids, function(f) fold_results[[f]][[gid]]$predicted))
+    all_true  <- unlist(lapply(fold_ids, function(f) fold_results[[f]][[gid]]$true))
+    
+    all_true <- factor(all_true, levels = c("no", "yes"))
+    if(length(unique(all_true)) < 2) {
+      auc_val <- NA
+    } else {
+      roc_obj <- roc(all_true, all_preds, levels = rev(levels(all_true)))
+      auc_val <- auc(roc_obj)
+    }
+    
+    results_df <- rbind(
+      results_df,
+      data.frame(Rep = rp, Combo = gid, AUC = auc_val)
+    )
+  }
+}
+
+# Boxplots of AUC by combo
+boxplot(AUC ~ Combo, data = results_df,
+        main = "AUC by Hyper-parameter Combo",
+        xlab = "Combo Index", ylab = "AUC")
+
+
+library(dplyr)
+summary_stats <- results_df %>%
+  group_by(Combo) %>%
+  summarize(meanAUC = mean(AUC, na.rm = TRUE)) %>%
+  arrange(desc(meanAUC))
+
+print(summary_stats)
+cat("Best combo by mean AUC:", summary_stats$Combo[1], "\n")
+```
+
+### Activity 6
+Repeat the previous code (flatten over $R \times K$) but create a cluster with 20 cores and measure elapsed time via `system.time()`. Then do the same with the physical core count (`detectCores(logical = FALSE)`) and compare.
+```{r}
+R <- 3
+K <- length(fold_indices)
+G <- length(grid_list)
+
+# Replicate the K-fold indices for R replications, then flatten
+rep_folds <- replicate(R, fold_indices, simplify = FALSE)
+all_folds <- do.call(c, rep_folds)  # length = R*K
+
+# 1. Time on 20 cores
+time_20 <- system.time({
+  cl_20 <- makePSOCKcluster(20)
+  clusterExport(cl_20, c("dat_sub", "grid_list", "all_folds"), envir = environment())
+  clusterEvalQ(cl_20, library(randomForest))
+  
+  fold_results_20 <- clusterApply(cl_20, seq_along(all_folds), function(i) {
+    # Same training+prediction code as in Activity 5 (no boxplots)
+    test_idx <- all_folds[[i]]
+    train_data <- dat_sub[-test_idx, ]
+    test_data  <- dat_sub[ test_idx, ]
+    if(!is.factor(train_data[,1])) train_data[,1] <- as.factor(train_data[,1])
+    pos_class <- levels(train_data[,1])[2]
+    
+    res <- vector("list", length(grid_list))
+    for(gid in seq_along(grid_list)) {
+      rf_fit <- randomForest(
+        x = train_data[, -1],
+        y = train_data[, 1],
+        mtry = grid_list[[gid]]$m,
+        ntree = grid_list[[gid]]$T
+      )
+      preds <- predict(rf_fit, newdata = test_data[, -1], type = "prob")[, pos_class]
+      res[[gid]] <- list(predicted = preds, true = test_data[,1])
+    }
+    res
+  })
+  
+  stopCluster(cl_20)
+})
+
+time_20
+
+# 2. Time on physical core count
+n_cores <- detectCores(logical = FALSE)
+time_phys <- system.time({
+  cl_phys <- makePSOCKcluster(n_cores)
+  clusterExport(cl_phys, c("dat_sub", "grid_list", "all_folds"), envir = environment())
+  clusterEvalQ(cl_phys, library(randomForest))
+  
+  fold_results_phys <- clusterApply(cl_phys, seq_along(all_folds), function(i) {
+    # Same code block
+    test_idx <- all_folds[[i]]
+    train_data <- dat_sub[-test_idx, ]
+    test_data  <- dat_sub[ test_idx, ]
+    if(!is.factor(train_data[,1])) train_data[,1] <- as.factor(train_data[,1])
+    pos_class <- levels(train_data[,1])[2]
+    
+    res <- vector("list", length(grid_list))
+    for(gid in seq_along(grid_list)) {
+      rf_fit <- randomForest(
+        x = train_data[, -1],
+        y = train_data[, 1],
+        mtry = grid_list[[gid]]$m,
+        ntree = grid_list[[gid]]$T
+      )
+      preds <- predict(rf_fit, newdata = test_data[, -1], type = "prob")[, pos_class]
+      res[[gid]] <- list(predicted = preds, true = test_data[,1])
+    }
+    res
+  })
+  
+  stopCluster(cl_phys)
+})
+
+time_phys
+```
+With 20 cores specified, the run took approximately 4.6 seconds (elapsed), while using the actual physical core count took about 2.8 seconds. This suggests that over‐subscribing cores (requesting more than the machine physically has) introduced extra overhead and led to slower performance than using the true physical core count.
+
+
+
+
